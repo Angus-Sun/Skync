@@ -65,7 +65,14 @@ io.on('connection', (socket) => {
     if (!rooms[roomId]) {
       rooms[roomId] = { strokes: [], elements: [] };
     }
-    //create the stroke container to store details of the stroke live for live updates of drawing
+
+    /*
+      Instrumentation: record server receive time and include it when broadcasting so
+      clients (and developers) can inspect timing. Keep existing behavior otherwise.
+    */
+    const serverReceivedAt = Date.now();
+
+    //creates/updates stroke in server storage
     let stroke = rooms[roomId].strokes.find((s) => s.id === strokeId);
     if (!stroke) {
       stroke = { id: strokeId, stroke: [], ownerId: socket.id };
@@ -73,9 +80,27 @@ io.on('connection', (socket) => {
     }
     //adds new point to update stroke
     stroke.stroke.push({ x: x1, y: y1, colour, tool, brushSize });
-    //broadcast stroke to entire room
-    io.to(roomId).emit('drawing', { ...data, ownerId: socket.id });
+    //broadcast stroke to entire room and include timestamps
+    io.to(roomId).emit('drawing', { ...data, ownerId: socket.id, serverReceivedAt });
   });
+
+  // Respond to client latency pings so clients can measure RTT
+  socket.on('latency-ping', ({ clientSentAt }) => {
+    socket.emit('latency-pong', { clientSentAt, serverReceivedAt: Date.now() });
+  });
+
+  // When other clients report that they received a stroke, forward the report to the original sender
+  socket.on('drawing-received', ({ strokeId, originalSenderId, measuredLatency }) => {
+    if (!originalSenderId) return;
+    // forward the receiver's measured latency back to the original sender socket id
+    io.to(originalSenderId).emit('stroke-latency-report', {
+      strokeId,
+      from: socket.id,
+      measuredLatency,
+      serverReceivedAt: Date.now()
+    });
+  });
+
   //removes stroke user undid and emits to room
   socket.on('undo', ({ roomId, strokeId }) => {
     if (!roomId || !strokeId) return;
