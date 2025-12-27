@@ -46,6 +46,11 @@ function Whiteboard() {
   const MAX_IMAGE_HEIGHT = 800;
   const MAX_IMAGE_WIDTH = 800;
   
+  // Latency measurement helpers
+  const latencyIntervalRef = useRef(null);
+  const strokeLatencyReports = useRef(new Map()); // map strokeId -> array of reported latencies
+  const [strokeLatencyDisplay, setStrokeLatencyDisplay] = useState({}); 
+
   //very unique random number generated based on time to generate stroke ID 
   const generateStrokeId = () =>
     `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
@@ -258,8 +263,28 @@ function Whiteboard() {
 
     //join the room specified by roomId when connected
     socketRef.current.on('connect', () => {
+      console.log('Socket connected:', socketRef.current.id);
       socketRef.current.emit('join-room', roomId);
     })
+
+    // latency debug handlers
+    socketRef.current.on('latency-pong', ({ clientSentAt, serverReceivedAt }) => {
+      const rtt = Date.now() - (clientSentAt || 0);
+      console.log('latency-pong:', { clientSentAt, serverReceivedAt, rtt });
+    });
+
+    socketRef.current.on('stroke-latency-report', (report) => {
+      try {
+        console.log('stroke-latency-report received:', report);
+        const { strokeId, measuredLatency } = report || {};
+        if (strokeId != null && measuredLatency != null) {
+          strokeLatencyReports.current.set(strokeId, (strokeLatencyReports.current.get(strokeId) || []).concat(measuredLatency));
+          setStrokeLatencyDisplay(prev => ({ ...prev, [strokeId]: strokeLatencyReports.current.get(strokeId) }));
+        }
+      } catch (e) {
+        console.warn('Error handling stroke-latency-report', e);
+      }
+    });
 
     socketRef.current.on('delete-element', ({ elementId }) => {
       setAllStrokes(prev => prev.filter(s => s.id !== elementId));
@@ -409,7 +434,7 @@ function Whiteboard() {
     //handle live drawing data from other clients for real-time updates
    socketRef.current.on('drawing', (data) => {
       if (!data) return;
-      const { strokeId, x0, y0, x1, y1, colour, tool, brushSize, ownerId } = data;
+      const { strokeId, x0, y0, x1, y1, colour, tool, brushSize, ownerId, serverReceivedAt } = data;
       
       //only process drawing events from other users
       if (ownerId !== socketRef.current.id) {
@@ -448,6 +473,26 @@ function Whiteboard() {
           }
           return newStrokes;
         });
+
+        // Measure server->client latency when possible and report back to server
+        try {
+          const now = Date.now();
+          if (serverReceivedAt) {
+            const serverToClientMs = now - serverReceivedAt; // time from when server recorded the packet to receipt here
+            console.log('Measured server->client latency for', strokeId, serverToClientMs, 'ms');
+            socketRef.current.emit('drawing-received', {
+              strokeId,
+              originalSenderId: ownerId,
+              measuredLatency: serverToClientMs
+            });
+            // optional debug state update
+            strokeLatencyReports.current.set(strokeId, (strokeLatencyReports.current.get(strokeId) || []).concat(serverToClientMs));
+            setStrokeLatencyDisplay(prev => ({ ...prev, [strokeId]: strokeLatencyReports.current.get(strokeId) }));
+          }
+        } catch (e) {
+          // best-effort, ignore errors
+          console.warn('latency measurement error', e);
+        }
       }
     });
     //when a stroke is completed, remove it from live strokes
@@ -491,6 +536,11 @@ function Whiteboard() {
 
     //disconnect socket when user disconnects or roomId changes
     return () => {
+      // clear latency ping interval if running
+      if (latencyIntervalRef.current) {
+        clearInterval(latencyIntervalRef.current);
+        latencyIntervalRef.current = null;
+      }
       socketRef.current.disconnect();
     };
   }, [roomId]);
@@ -1112,6 +1162,7 @@ function Whiteboard() {
       tool,
       brushSize: size,
       ownerId: socketRef.current.id,
+      clientSentAt: Date.now(), // timestamp for latency instrumentation
     });
 
     lastX.current = offsetX;
